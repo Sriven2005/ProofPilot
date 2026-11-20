@@ -1,0 +1,42 @@
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { sqlBenchmarkCases, scenario } from './benchmarks/sqlRetailBenchmark.ts';
+import { evaluateSqlBenchmark, type SqlExecutionResult } from '../src/lib/sqlEvaluation.ts';
+
+assert.equal(sqlBenchmarkCases.length,20,'benchmark contains twenty distinct submissions');
+assert.ok(sqlBenchmarkCases.every(item=>item.relevantCriteria.length>0 && item.expectedFindings.length>0 && item.rationale.length>20),'each case has rubric criteria, expected findings, and reference rationale');
+assert.equal(Object.values(scenario.weights).reduce((a,b)=>a+b,0),100);
+const run=spawnSync('python',['src/server/sqlite_sandbox.py'],{encoding:'utf8',input:JSON.stringify(sqlBenchmarkCases),timeout:20000,maxBuffer:4*1024*1024});
+assert.equal(run.status,0,`isolated SQLite runner failed: ${run.stderr || run.stdout}`);
+const execution=JSON.parse(run.stdout) as SqlExecutionResult[];
+assert.equal(execution.length,20);
+const scores=sqlBenchmarkCases.map((item,index)=>({item,execution:execution[index],evaluation:evaluateSqlBenchmark(item,execution[index])}));
+assert.equal(scores.find(x=>x.item.id==='sql-17')?.evaluation.score,0,'empty submission is zero');
+assert.ok((scores.find(x=>x.item.id==='sql-18')?.evaluation.score??100)<=5,'irrelevant response must be near zero');
+assert.ok((scores.find(x=>x.item.id==='sql-19')?.evaluation.score??100)<=25,'keyword comments cannot earn credit');
+for(const id of ['sql-06','sql-09','sql-10']) {
+  const result=scores.find(x=>x.item.id===id)!.evaluation;
+  assert.ok(result.score<=49,`${id} essential integrity/type defect cannot reach proficiency`);
+  assert.equal(result.components?.essentialGateApplied,true,`${id} reports its essential gate`);
+}
+for(const id of ['sql-07','sql-11','sql-12','sql-14','sql-16']) assert.ok((scores.find(x=>x.item.id===id)?.evaluation.score??100)<=49,`${id} essential schema/query/security failure must remain below proficiency`);
+assert.equal(scores.find(x=>x.item.id==='sql-01')?.evaluation.score,100,'excellent SQL solution passes full verification');
+assert.equal(scores.find(x=>x.item.id==='sql-01')?.evaluation.criteria.some(c=>c.missing.length>0),false,'complete verified SQL should not be told to add requirements it already satisfies');
+assert.equal(scores.find(x=>x.item.id==='sql-03')?.execution.queryOk,true,'valid text-key alternative executes');
+assert.equal(scores.find(x=>x.item.id==='sql-20')?.execution.queryOk,true,'correlated EXISTS alternative executes');
+assert.ok((scores.find(x=>x.item.id==='sql-03')?.evaluation.score??0)>=90 && (scores.find(x=>x.item.id==='sql-20')?.evaluation.score??0)>=90,'both valid alternatives receive strong scores');
+assert.equal(scores.find(x=>x.item.id==='sql-11')?.execution.queryOk,false,'syntax error is detected as non-executable');
+assert.ok((scores.find(x=>x.item.id==='sql-12')?.evaluation.score??100)<70,'wrong repeat threshold is penalized');
+assert.ok((scores.find(x=>x.item.id==='sql-13')?.evaluation.score??100)<70,'fan-out aggregation is penalized');
+assert.ok((scores.find(x=>x.item.id==='sql-15')?.evaluation.score??100)<70,'wrong aggregation is penalized');
+assert.ok(scores.find(x=>x.item.id==='sql-16')?.evaluation.criteria.some(c=>c.incorrect.some(e=>e.includes('interpolates untrusted input'))),'injection risk is explicitly reported');
+assert.ok(scores.every(x=>x.evaluation.criteria.reduce((sum,c)=>sum+c.weight,0)===100),'criterion weights sum to 100 for each result');
+assert.ok(scores.every(x=>Math.round(x.evaluation.criteria.reduce((sum,c)=>sum+c.score*c.weight,0)/100)===x.evaluation.score),'overall score equals its weighted criterion breakdown');
+const differences=scores.map(({item,evaluation})=>Math.abs(evaluation.score-item.reference));
+const within5=differences.filter((x,i)=>x<=scores[i].item.tolerance).length;
+const within10=differences.filter(x=>x<=10).length;
+const invalidCategories=['irrelevant','empty','keyword-heavy wrong','design error','missing FK','invalid FK','data types','missing NOT NULL','syntax error','wrong threshold','fan-out','grouping error','aggregation error','injection risk'];
+const highFalsePositives=scores.filter(({item,evaluation})=>invalidCategories.includes(item.category)&&evaluation.score>=70);
+const overReference=scores.filter(({item,evaluation})=>evaluation.score-item.reference>10);
+const underReference=scores.filter(({item,evaluation})=>item.reference-evaluation.score>10);
+console.log(JSON.stringify({cases:scores.map(({item,execution,evaluation})=>({id:item.id,title:item.title,category:item.category,reference:item.reference,actual:evaluation.score,difference:evaluation.score-item.reference,tolerance:item.tolerance,schemaOk:execution.schemaOk,seedOk:execution.seedOk,queryOk:execution.queryOk,correctRows:JSON.stringify(execution.rows),findings:execution.findings})),stats:{meanAbsoluteDifference:Number((differences.reduce((a,b)=>a+b,0)/differences.length).toFixed(2)),within5:`${within5}/${scores.length}`,within5Percent:Number((within5/scores.length*100).toFixed(1)),within10:`${within10}/${scores.length}`,within10Percent:Number((within10/scores.length*100).toFixed(1)),falsePositiveHighScores:highFalsePositives.length,falsePositiveCaseIds:highFalsePositives.map(x=>x.item.id),overReferenceByMoreThan10:overReference.map(x=>x.item.id),underReferenceByMoreThan10:underReference.map(x=>x.item.id),validAlternatives:scores.filter(x=>x.item.category==='valid alternative').map(x=>({id:x.item.id,score:x.evaluation.score}))}},null,2));

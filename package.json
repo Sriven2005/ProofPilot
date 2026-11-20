@@ -1,0 +1,47 @@
+{
+  "name": "proofpilot",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "test:evaluator": "node --experimental-strip-types tests/evaluation.test.ts",
+    "test:benchmark": "node --experimental-strip-types tests/sql_benchmark.test.ts",
+    "test:regression": "node --experimental-strip-types tests/sql_holdout.test.ts",
+    "test:sql-blind-holdout": "node --experimental-strip-types tests/sql_blind_holdout.test.ts",
+    "test:sql-workflow": "node --experimental-strip-types tests/sql_workflow.test.ts",
+    "test:data-analyst": "node --experimental-strip-types tests/data_analyst.test.ts",
+    "test:assessment-workspace": "node --experimental-strip-types tests/assessment_workspace.test.ts",
+    "test:mvp-access": "node --experimental-strip-types tests/mvp_access.test.ts",
+    "test:gemini-shadow": "node --experimental-strip-types tests/gemini_shadow.test.ts",
+    "test:auth": "node --experimental-strip-types tests/auth.test.ts",
+    "test:progress": "node --experimental-strip-types tests/assessment_progress.test.ts",
+    "test:database": "node --experimental-strip-types tests/database_foundation.test.ts",
+    "test:persistence": "node --experimental-strip-types tests/persistence_compat.test.ts",
+    "test:assessment-catalog": "node --experimental-strip-types tests/assessment_catalog.test.ts",
+    "lint": "oxlint",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@monaco-editor/react": "^4.7.0",
+    "@supabase/supabase-js": "^2.119.0",
+    "monaco-editor": "0.57.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "sql.js": "^1.16.0"
+  },
+  "overrides": {
+    "dompurify": "3.4.18"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@types/sql.js": "^1.4.11",
+    "@vitejs/plugin-react": "^6.1.2",
+    "oxlint": "^1.90.0",
+    "typescript": "~7.0.2",
+    "vite": "^8.3.6"
+  }
+}

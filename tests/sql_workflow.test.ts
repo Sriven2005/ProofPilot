@@ -1,0 +1,67 @@
+import assert from 'node:assert/strict';
+import { createServer } from 'vite';
+import { sqlEvaluatorPlugin } from '../src/server/sqlEvaluatorPlugin.ts';
+
+assert.equal(sqlEvaluatorPlugin().configurePreviewServer, undefined, 'legacy SQL middleware is not installed in Vite preview');
+
+const schema=`-- Schema\nCREATE TABLE customers(customer_id INTEGER PRIMARY KEY,name TEXT NOT NULL,email TEXT NOT NULL UNIQUE); CREATE TABLE orders(order_id INTEGER PRIMARY KEY,customer_id INTEGER NOT NULL REFERENCES customers(customer_id),order_date TEXT NOT NULL,total_cents INTEGER NOT NULL CHECK(total_cents>=0));`;
+const seed=`-- Sample data\nINSERT INTO customers VALUES(1,'Mina','m@test'),(2,'Ravi','r@test'),(3,'Li','l@test'),(4,'Nora','n@test'); INSERT INTO orders VALUES(101,1,'2026-01-02',10000),(102,1,'2026-01-02',14550),(103,2,'2026-02-04',900),(104,3,'2026-01-10',1000),(105,3,'2026-02-10',2000),(106,3,'2026-03-10',2500);`;
+const query=`-- Query\nSELECT c.customer_id customer_key,c.name customer_name,COUNT(DISTINCT o.order_id) order_count,SUM(o.total_cents) total_spend_cents FROM customers c JOIN orders o ON o.customer_id=c.customer_id GROUP BY c.customer_id,c.name HAVING COUNT(DISTINCT o.order_id)>=2;`;
+const previousShadowSetting=process.env.PROOFPILOT_DISABLE_GEMINI_SHADOW;
+process.env.PROOFPILOT_DISABLE_GEMINI_SHADOW='true';
+const server=await createServer({configFile:'vite.config.ts',logLevel:'error',server:{host:'127.0.0.1',port:0,strictPort:false}});
+try {
+  await server.listen();
+  const address=server.httpServer?.address();
+  assert.ok(address&&typeof address==='object','Vite server must bind to an ephemeral port');
+  const endpoint=`http://127.0.0.1:${address.port}/api/evaluate/sql`;
+  const runEndpoint=`${endpoint}/run`;
+  const submit=async(answer:string,challengeId='analyst-sql-retention')=>fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({challengeId,answer})});
+  const run=async(schemaSql:string,seedSql:string,querySql:string)=>fetch(runEndpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({challengeId:'analyst-sql-retention',schema:schemaSql,seed:seedSql,query:querySql})});
+  const workspaceRun=await run('PRAGMA foreign_keys=ON; CREATE TABLE customers(id INTEGER PRIMARY KEY,name TEXT NOT NULL); CREATE TABLE orders(id INTEGER PRIMARY KEY,customer_id INTEGER NOT NULL REFERENCES customers(id),amount_cents INTEGER NOT NULL CHECK(amount_cents>=0));',"INSERT INTO customers VALUES (1,'Mina'); INSERT INTO orders VALUES(1,1,250);",'SELECT c.name,COUNT(*) AS orders,SUM(o.amount_cents) AS total_cents FROM customers c JOIN orders o ON o.customer_id=c.id GROUP BY c.id,c.name');
+  assert.equal(workspaceRun.status,200,'workspace run endpoint executes SQL in the assessment runtime');
+  const workspaceResult=await workspaceRun.json() as {schemaOk:boolean;seedOk:boolean;queryOk:boolean;rows:unknown[][];errors:Record<string,string>};
+  assert.equal(workspaceResult.schemaOk,true,'harmless foreign_keys pragma and valid schema are accepted');
+  assert.equal(workspaceResult.seedOk,true);
+  assert.equal(workspaceResult.queryOk,true);
+  assert.deepEqual(workspaceResult.rows,[['Mina',1,250]],'query response contains actual SQLite output');
+  const invalidRun=await run('CREATE TABLE facts(value INTEGER);','INSERT INTO facts VALUES(1);','SELECT missing_column FROM facts');
+  assert.equal(invalidRun.status,200);
+  const invalidRunResult=await invalidRun.json() as {queryOk:boolean;errors:Record<string,string>};
+  assert.equal(invalidRunResult.queryOk,false,'invalid SQL reports a genuine execution failure');
+  assert.match(invalidRunResult.errors.query,/no such column/i);
+  const unsafeRun=await run('CREATE TABLE facts(value INTEGER);','INSERT INTO facts VALUES(1);','DELETE FROM facts');
+  const unsafeResult=await unsafeRun.json() as {queryOk:boolean;errors:Record<string,string>};
+  assert.equal(unsafeResult.queryOk,false,'workspace query phase denies writes');
+  assert.match(unsafeResult.errors.query,/not authorized/i);
+  const good=await submit(`${schema}\n${seed}\n${query}\n-- Reasoning\nGroup by customer because each output row should represent one customer. Count order IDs, not dates, and use a hidden fixture with same-day orders to validate the result.`);
+  assert.equal(good.status,200);
+  const goodEvaluation=await good.json() as {score:number;criteria:Array<{name:string;weight:number;score:number;evidence:string[]}>;components:{deterministicVerification:number;technicalReasoning:number;essentialGateApplied:boolean}};
+  assert.equal(goodEvaluation.score,Math.round(goodEvaluation.criteria.reduce((sum,c)=>sum+c.score*c.weight,0)/100));
+  assert.equal(goodEvaluation.components.essentialGateApplied,false);
+  assert.ok(goodEvaluation.score>=75,'correct SQL plus supported reasoning should score strongly');
+  assert.ok(goodEvaluation.criteria.find(c=>c.name==='Reasoning and approach')?.evidence.some(e=>e.includes('customer')));
+  const simplerSchema=`-- Schema\nPRAGMA foreign_keys=ON; CREATE TABLE customers(id INTEGER PRIMARY KEY,customer_name TEXT NOT NULL); CREATE TABLE orders(id INTEGER PRIMARY KEY,customer_id INTEGER NOT NULL REFERENCES customers(id),amount_cents INTEGER NOT NULL CHECK(amount_cents>=0));`;
+  const simplerSeed=`-- Sample Data\nINSERT INTO customers VALUES(1,'Mina'),(2,'Ravi'),(3,'Li'),(4,'Nora'); INSERT INTO orders VALUES(101,1,10000),(102,1,14550),(103,2,900),(104,3,1000),(105,3,2000),(106,3,2500);`;
+  const simplerQuery=`-- Query\nSELECT c.customer_name,COUNT(DISTINCT o.id) AS order_count,SUM(o.amount_cents) AS total_spend_cents FROM customers c JOIN orders o ON o.customer_id=c.id GROUP BY c.id,c.customer_name HAVING COUNT(DISTINCT o.id)>1;`;
+  const alternativeSchema=await submit(`${simplerSchema}\n${simplerSeed}\n${simplerQuery}\n-- Reasoning\nCustomer grain is one row per person. Count distinct order IDs and sum integer-cent amounts. I included a customer with no orders to check that inner joins only return buyers.`);
+  const alternativeEvaluation=await alternativeSchema.json() as {score:number;criteria:Array<{name:string;missing:string[]}>;components:{essentialGateApplied:boolean}};
+  assert.equal(alternativeEvaluation.components.essentialGateApplied,false,'valid customer/amount aliases without optional email or date columns are accepted');
+  assert.ok(alternativeEvaluation.score>=75,`semantically valid alternative schema should not be capped (got ${alternativeEvaluation.score})`);
+  assert.equal(alternativeEvaluation.criteria.find(c=>c.name==='Technical correctness')?.missing.some(item=>/email|date/i.test(item)),false);
+  const invalid=await submit(`${schema}\n${seed}\n${query.replace('>=2','>=3')}\n-- Reasoning\nThe schema is correct, I grouped by customer and summed cents. The threshold of three orders is appropriate for repeat customers, and this result should be validated against a controlled fixture.`);
+  assert.equal(invalid.status,200);
+  const invalidEvaluation=await invalid.json() as {score:number;components:{essentialGateApplied:boolean}};
+  assert.ok(invalidEvaluation.score<=49,'wrong business result cannot score proficiently');
+  assert.equal(invalidEvaluation.components.essentialGateApplied,true);
+  const unsupported=await submit('SELECT 1;');
+  const unsupportedEvaluation=await unsupported.json() as {score:number};
+  assert.equal(unsupportedEvaluation.score,0,'irrelevant SQL must score zero');
+  const wrongChallenge=await submit(`${schema}\n${seed}\n${query}`,'analyst-retention');
+  assert.equal(wrongChallenge.status,400,'the API only accepts the SQL challenge ID');
+  console.log(JSON.stringify({endpoints:['Vite SQL workspace run','Vite SQL evaluation'],cases:9,valid:goodEvaluation.score,validAlternative:alternativeEvaluation.score,invalid:invalidEvaluation.score,irrelevant:unsupportedEvaluation.score,wrongChallengeStatus:wrongChallenge.status}));
+} finally {
+  await server.close();
+  if(previousShadowSetting===undefined) delete process.env.PROOFPILOT_DISABLE_GEMINI_SHADOW;
+  else process.env.PROOFPILOT_DISABLE_GEMINI_SHADOW=previousShadowSetting;
+}
